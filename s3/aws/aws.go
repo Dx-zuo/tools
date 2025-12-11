@@ -26,11 +26,14 @@ const (
 )
 
 type Config struct {
+	Endpoint        string // 自定义端点，用于 S3 兼容存储（如 RustFS、MinIO 等）
 	Region          string
 	Bucket          string
+	BucketURL       string // 公开访问的 Bucket URL（可选）
 	AccessKeyID     string
 	SecretAccessKey string
 	SessionToken    string
+	PublicRead      bool // 是否公开读取
 }
 
 func NewAws(conf Config) (*Aws, error) {
@@ -38,18 +41,45 @@ func NewAws(conf Config) (*Aws, error) {
 		Region:      conf.Region,
 		Credentials: credentials.NewStaticCredentialsProvider(conf.AccessKeyID, conf.SecretAccessKey, conf.SessionToken),
 	}
-	client := aws3.NewFromConfig(cfg)
+
+	// 构建 S3 客户端选项
+	var opts []func(*aws3.Options)
+
+	// 支持自定义 endpoint（S3 兼容存储：RustFS、MinIO、Ceph 等）
+	if conf.Endpoint != "" {
+		opts = append(opts, func(o *aws3.Options) {
+			o.BaseEndpoint = aws.String(conf.Endpoint)
+			o.UsePathStyle = true // S3 兼容存储通常需要 path-style
+		})
+	}
+
+	client := aws3.NewFromConfig(cfg, opts...)
+
+	// 处理 BucketURL
+	bucketURL := conf.BucketURL
+	if bucketURL == "" && conf.Endpoint != "" {
+		// 如果没有指定 BucketURL，则根据 endpoint 和 bucket 构建
+		bucketURL = strings.TrimSuffix(conf.Endpoint, "/") + "/" + conf.Bucket
+	}
+	if bucketURL != "" && !strings.HasSuffix(bucketURL, "/") {
+		bucketURL += "/"
+	}
+
 	return &Aws{
-		bucket:  conf.Bucket,
-		client:  client,
-		presign: aws3.NewPresignClient(client),
+		bucket:     conf.Bucket,
+		bucketURL:  bucketURL,
+		client:     client,
+		presign:    aws3.NewPresignClient(client),
+		publicRead: conf.PublicRead,
 	}, nil
 }
 
 type Aws struct {
-	bucket  string
-	client  *aws3.Client
-	presign *aws3.PresignClient
+	bucket     string
+	bucketURL  string
+	client     *aws3.Client
+	presign    *aws3.PresignClient
+	publicRead bool
 }
 
 func (a *Aws) Engine() string {
