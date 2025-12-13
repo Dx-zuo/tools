@@ -96,6 +96,8 @@ func NewAws(conf Config) (*Aws, error) {
 		opts = append(opts, func(o *aws3.Options) {
 			o.EndpointResolverV2 = &customEndpointResolver{endpoint: conf.Endpoint}
 			o.UsePathStyle = true // S3 兼容存储通常需要 path-style
+			// 禁用 S3 Express 会话认证（避免额外的 endpoint 解析）
+			o.DisableS3ExpressSessionAuth = aws.Bool(true)
 		})
 	}
 
