@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -46,6 +47,8 @@ func NewAws(conf Config) (*Aws, error) {
 
 	// 构建 S3 客户端选项
 	var opts []func(*aws3.Options)
+	// presign 使用的端点，优先外部 bucketURL（希望对外暴露的域名），否则退回内部 endpoint
+	var presignEndpoint string
 
 	// 支持自定义 endpoint（S3 兼容存储：RustFS、MinIO、Ceph 等）
 	if conf.Endpoint != "" {
@@ -76,6 +79,7 @@ func NewAws(conf Config) (*Aws, error) {
 			o.BaseEndpoint = aws.String(conf.Endpoint)
 			o.UsePathStyle = true // S3 兼容存储必须使用 path-style（如 MinIO、RustFS、Ceph）
 		})
+		presignEndpoint = conf.Endpoint
 	}
 
 	client := aws3.NewFromConfig(cfg, opts...)
@@ -89,13 +93,29 @@ func NewAws(conf Config) (*Aws, error) {
 	if bucketURL != "" && !strings.HasSuffix(bucketURL, "/") {
 		bucketURL += "/"
 	}
+	if bucketURL != "" {
+		presignEndpoint = strings.TrimSuffix(bucketURL, "/")
+	}
+
+	// Debug log to verify config propagation.
+	log.Printf("[aws] NewAws config endpoint=%q bucketURL=%q rawBucketURL=%q bucket=%q", conf.Endpoint, bucketURL, conf.BucketURL, conf.Bucket)
+
+	// presign 客户端：使用对外域名（bucketURL）做签名，保证上传/下载用同一 Host，不破坏签名
+	var presignOpts []func(*aws3.Options)
+	if presignEndpoint != "" {
+		presignOpts = append(presignOpts, func(o *aws3.Options) {
+			o.BaseEndpoint = aws.String(presignEndpoint)
+			o.UsePathStyle = true
+		})
+	}
+	presignClient := aws3.NewPresignClient(aws3.NewFromConfig(cfg, presignOpts...))
 
 	return &Aws{
 		bucket:     conf.Bucket,
 		bucketURL:  bucketURL,
 		endpoint:   conf.Endpoint,
 		client:     client,
-		presign:    aws3.NewPresignClient(client),
+		presign:    presignClient,
 		publicRead: conf.PublicRead,
 	}, nil
 }
@@ -115,9 +135,9 @@ func (a *Aws) replaceEndpointURL(rawURL string) string {
 }
 
 type Aws struct {
-	bucket       string
-	bucketURL    string
-	endpoint     string // 内部 endpoint，用于 URL 替换
+	bucket     string
+	bucketURL  string
+	endpoint   string // 内部 endpoint，用于 URL 替换
 	client     *aws3.Client
 	presign    *aws3.PresignClient
 	publicRead bool
@@ -137,6 +157,14 @@ func (a *Aws) PartLimit() (*s3.PartLimit, error) {
 
 func (a *Aws) formatETag(etag string) string {
 	return strings.Trim(etag, `"`)
+}
+
+func (a *Aws) publicACL() *types.ObjectCannedACL {
+	if !a.publicRead {
+		return nil
+	}
+	acl := types.ObjectCannedACLPublicRead
+	return &acl
 }
 
 func (a *Aws) PartSize(ctx context.Context, size int64) (int64, error) {
@@ -168,11 +196,15 @@ func (a *Aws) IsNotFound(err error) bool {
 }
 
 func (a *Aws) PresignedPutObject(ctx context.Context, name string, expire time.Duration, opt *s3.PutOption) (*s3.PresignedPutResult, error) {
-	res, err := a.presign.PresignPutObject(ctx, &aws3.PutObjectInput{Bucket: aws.String(a.bucket), Key: aws.String(name)}, aws3.WithPresignExpires(expire), withDisableHTTPPresignerHeaderV4(nil))
+	input := &aws3.PutObjectInput{Bucket: aws.String(a.bucket), Key: aws.String(name)}
+	if acl := a.publicACL(); acl != nil {
+		input.ACL = *acl
+	}
+	res, err := a.presign.PresignPutObject(ctx, input, aws3.WithPresignExpires(expire), withDisableHTTPPresignerHeaderV4(nil))
 	if err != nil {
 		return nil, err
 	}
-	return &s3.PresignedPutResult{URL: res.URL}, nil
+	return &s3.PresignedPutResult{URL: res.URL, Header: res.SignedHeader}, nil
 }
 
 func (a *Aws) DeleteObject(ctx context.Context, name string) error {
@@ -223,7 +255,11 @@ func (a *Aws) StatObject(ctx context.Context, name string) (*s3.ObjectInfo, erro
 }
 
 func (a *Aws) InitiateMultipartUpload(ctx context.Context, name string, opt *s3.PutOption) (*s3.InitiateMultipartUploadResult, error) {
-	res, err := a.client.CreateMultipartUpload(ctx, &aws3.CreateMultipartUploadInput{Bucket: aws.String(a.bucket), Key: aws.String(name)})
+	input := &aws3.CreateMultipartUploadInput{Bucket: aws.String(a.bucket), Key: aws.String(name)}
+	if acl := a.publicACL(); acl != nil {
+		input.ACL = *acl
+	}
+	res, err := a.client.CreateMultipartUpload(ctx, input)
 	if err != nil {
 		return nil, err
 	}
@@ -330,9 +366,7 @@ func (a *Aws) AuthSign(ctx context.Context, uploadID string, name string, expire
 		if err != nil {
 			return nil, err
 		}
-		// 将内部 endpoint URL 替换为外部 bucketURL
-		presignedURL := a.replaceEndpointURL(val.URL)
-		u, err := url.Parse(presignedURL)
+		u, err := url.Parse(val.URL)
 		if err != nil {
 			return nil, err
 		}
