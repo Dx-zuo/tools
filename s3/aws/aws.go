@@ -17,24 +17,42 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	aws3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	smithyendpoints "github.com/aws/smithy-go/endpoints"
 	"github.com/openimsdk/tools/s3"
 )
 
 const (
-	minPartSize int64 = 1024 * 1024 * 5        // 1MB
-	maxPartSize int64 = 1024 * 1024 * 1024 * 5 // 5GB
-	maxNumSize  int64 = 10000
+	minPartSize int64 = 1024 * 1024 * 5        // 5MB（S3 最小分片大小）
+	maxPartSize int64 = 1024 * 1024 * 1024 * 5 // 5GB（S3 最大分片大小）
+	maxNumSize  int64 = 10000                  // S3 最大分片数量
 )
 
 type Config struct {
-	Endpoint        string // 自定义端点，用于 S3 兼容存储（如 RustFS、MinIO 等）
-	Region          string
-	Bucket          string
-	BucketURL       string // 公开访问的 Bucket URL（可选）
-	AccessKeyID     string
-	SecretAccessKey string
-	SessionToken    string
-	PublicRead      bool // 是否公开读取
+	Endpoint           string // 自定义端点，用于 S3 兼容存储（如 RustFS、MinIO 等）
+	Region             string
+	Bucket             string
+	BucketURL          string // 公开访问的 Bucket URL（可选，用于生成外部访问链接）
+	AccessKeyID        string
+	SecretAccessKey    string
+	SessionToken       string
+	PublicRead         bool // 是否公开读取
+	InsecureSkipVerify bool // 是否跳过 TLS 证书验证（用于自签名证书）
+}
+
+// customEndpointResolver 自定义 endpoint 解析器，用于 S3 兼容存储
+type customEndpointResolver struct {
+	endpoint string
+}
+
+func (r *customEndpointResolver) ResolveEndpoint(ctx context.Context, params aws3.EndpointParameters) (smithyendpoints.Endpoint, error) {
+	// 直接返回配置的 endpoint，不进行任何转换
+	u, err := url.Parse(r.endpoint)
+	if err != nil {
+		return smithyendpoints.Endpoint{}, err
+	}
+	return smithyendpoints.Endpoint{
+		URI: *u,
+	}, nil
 }
 
 func NewAws(conf Config) (*Aws, error) {
@@ -48,24 +66,29 @@ func NewAws(conf Config) (*Aws, error) {
 
 	// 支持自定义 endpoint（S3 兼容存储：RustFS、MinIO、Ceph 等）
 	if conf.Endpoint != "" {
-		// 检查是否为 HTTP endpoint
+		// 检查是否需要自定义 HTTP 客户端
+		// 1. HTTP endpoint 需要禁用 TLS
+		// 2. HTTPS + InsecureSkipVerify 需要跳过证书验证（用于自签名证书）
 		isHTTP := strings.HasPrefix(strings.ToLower(conf.Endpoint), "http://")
 
-		// 创建自定义 HTTP 客户端（对于 HTTP endpoint，禁用 TLS）
-		if isHTTP {
+		if isHTTP || conf.InsecureSkipVerify {
 			customHTTPClient := &http.Client{
+				Timeout: time.Minute * 10, // 设置合理的超时时间
 				Transport: &http.Transport{
 					TLSClientConfig: &tls.Config{
-						InsecureSkipVerify: true,
+						InsecureSkipVerify: isHTTP || conf.InsecureSkipVerify,
 					},
+					MaxIdleConns:        100,
+					MaxIdleConnsPerHost: 100,
+					IdleConnTimeout:     90 * time.Second,
 				},
 			}
 			cfg.HTTPClient = customHTTPClient
 		}
 
-		// 使用 BaseEndpoint 配置自定义 endpoint
+		// 使用自定义 EndpointResolverV2 完全控制 endpoint 解析
 		opts = append(opts, func(o *aws3.Options) {
-			o.BaseEndpoint = aws.String(conf.Endpoint)
+			o.EndpointResolverV2 = &customEndpointResolver{endpoint: conf.Endpoint}
 			o.UsePathStyle = true // S3 兼容存储通常需要 path-style
 		})
 	}
@@ -278,9 +301,6 @@ func (a *Aws) ListUploadedParts(ctx context.Context, uploadID string, name strin
 		var val s3.UploadedPart
 		if part.PartNumber != nil {
 			val.PartNumber = int(*part.PartNumber)
-		}
-		if part.LastModified != nil {
-			val.LastModified = *part.LastModified
 		}
 		if part.LastModified != nil {
 			val.LastModified = *part.LastModified
