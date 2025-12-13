@@ -2,6 +2,7 @@ package aws
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net/http"
@@ -47,6 +48,22 @@ func NewAws(conf Config) (*Aws, error) {
 
 	// 支持自定义 endpoint（S3 兼容存储：RustFS、MinIO、Ceph 等）
 	if conf.Endpoint != "" {
+		// 检查是否为 HTTP endpoint
+		isHTTP := strings.HasPrefix(strings.ToLower(conf.Endpoint), "http://")
+
+		// 创建自定义 HTTP 客户端（对于 HTTP endpoint，禁用 TLS）
+		if isHTTP {
+			customHTTPClient := &http.Client{
+				Transport: &http.Transport{
+					TLSClientConfig: &tls.Config{
+						InsecureSkipVerify: true,
+					},
+				},
+			}
+			cfg.HTTPClient = customHTTPClient
+		}
+
+		// 使用 BaseEndpoint 配置自定义 endpoint
 		opts = append(opts, func(o *aws3.Options) {
 			o.BaseEndpoint = aws.String(conf.Endpoint)
 			o.UsePathStyle = true // S3 兼容存储通常需要 path-style
@@ -191,7 +208,7 @@ func (a *Aws) InitiateMultipartUpload(ctx context.Context, name string, opt *s3.
 	}
 	return &s3.InitiateMultipartUploadResult{
 		Key:      name,
-		Bucket:   name,
+		Bucket:   a.bucket,
 		UploadID: *res.UploadId,
 	}, nil
 }
