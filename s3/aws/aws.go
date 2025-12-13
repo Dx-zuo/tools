@@ -93,15 +93,31 @@ func NewAws(conf Config) (*Aws, error) {
 	return &Aws{
 		bucket:     conf.Bucket,
 		bucketURL:  bucketURL,
+		endpoint:   conf.Endpoint,
 		client:     client,
 		presign:    aws3.NewPresignClient(client),
 		publicRead: conf.PublicRead,
 	}, nil
 }
 
+// replaceEndpointURL 将内部 endpoint URL 替换为外部 bucketURL
+// 例如: http://rustfs:9000/openim/path -> https://static.mixchat.cc/path
+func (a *Aws) replaceEndpointURL(rawURL string) string {
+	if a.endpoint == "" || a.bucketURL == "" {
+		return rawURL
+	}
+	// 构建内部 URL 前缀（endpoint + bucket）
+	internalPrefix := strings.TrimSuffix(a.endpoint, "/") + "/" + a.bucket
+	// 外部 URL 前缀
+	externalPrefix := strings.TrimSuffix(a.bucketURL, "/")
+	// 替换
+	return strings.Replace(rawURL, internalPrefix, externalPrefix, 1)
+}
+
 type Aws struct {
-	bucket     string
-	bucketURL  string
+	bucket       string
+	bucketURL    string
+	endpoint     string // 内部 endpoint，用于 URL 替换
 	client     *aws3.Client
 	presign    *aws3.PresignClient
 	publicRead bool
@@ -314,7 +330,9 @@ func (a *Aws) AuthSign(ctx context.Context, uploadID string, name string, expire
 		if err != nil {
 			return nil, err
 		}
-		u, err := url.Parse(val.URL)
+		// 将内部 endpoint URL 替换为外部 bucketURL
+		presignedURL := a.replaceEndpointURL(val.URL)
+		u, err := url.Parse(presignedURL)
 		if err != nil {
 			return nil, err
 		}
@@ -346,7 +364,8 @@ func (a *Aws) AccessURL(ctx context.Context, name string, expire time.Duration, 
 	if err != nil {
 		return "", err
 	}
-	return res.URL, nil
+	// 将内部 endpoint URL 替换为外部 bucketURL
+	return a.replaceEndpointURL(res.URL), nil
 }
 
 func (a *Aws) FormData(ctx context.Context, name string, size int64, contentType string, duration time.Duration) (*s3.FormData, error) {
