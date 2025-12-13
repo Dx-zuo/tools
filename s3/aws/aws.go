@@ -17,7 +17,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	aws3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
-	smithyendpoints "github.com/aws/smithy-go/endpoints"
 	"github.com/openimsdk/tools/s3"
 )
 
@@ -37,28 +36,6 @@ type Config struct {
 	SessionToken       string
 	PublicRead         bool // 是否公开读取
 	InsecureSkipVerify bool // 是否跳过 TLS 证书验证（用于自签名证书）
-}
-
-// customEndpointResolver 自定义 endpoint 解析器，用于 S3 兼容存储
-type customEndpointResolver struct {
-	endpoint string
-}
-
-func (r *customEndpointResolver) ResolveEndpoint(ctx context.Context, params aws3.EndpointParameters) (smithyendpoints.Endpoint, error) {
-	// 直接返回配置的 endpoint，不进行任何转换
-	u, err := url.Parse(r.endpoint)
-	if err != nil {
-		return smithyendpoints.Endpoint{}, err
-	}
-
-	// 调试日志：打印 endpoint 解析信息
-	fmt.Printf("[S3 Debug] ResolveEndpoint called: endpoint=%s, scheme=%s, host=%s, bucket=%v, region=%v\n",
-		r.endpoint, u.Scheme, u.Host,
-		aws.ToString(params.Bucket), aws.ToString(params.Region))
-
-	return smithyendpoints.Endpoint{
-		URI: *u,
-	}, nil
 }
 
 func NewAws(conf Config) (*Aws, error) {
@@ -92,12 +69,12 @@ func NewAws(conf Config) (*Aws, error) {
 			cfg.HTTPClient = customHTTPClient
 		}
 
-		// 使用自定义 EndpointResolverV2 完全控制 endpoint 解析
+		// AWS 官方推荐：使用 BaseEndpoint + UsePathStyle 支持 S3 兼容存储
+		// 参考: https://docs.aws.amazon.com/sdk-for-go/v2/developer-guide/configure-endpoints.html
+		// 参考: https://github.com/aws/aws-sdk-go-v2/issues/2573
 		opts = append(opts, func(o *aws3.Options) {
-			o.EndpointResolverV2 = &customEndpointResolver{endpoint: conf.Endpoint}
-			o.UsePathStyle = true // S3 兼容存储通常需要 path-style
-			// 禁用 S3 Express 会话认证（避免额外的 endpoint 解析）
-			o.DisableS3ExpressSessionAuth = aws.Bool(true)
+			o.BaseEndpoint = aws.String(conf.Endpoint)
+			o.UsePathStyle = true // S3 兼容存储必须使用 path-style（如 MinIO、RustFS、Ceph）
 		})
 	}
 
